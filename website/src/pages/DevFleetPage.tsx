@@ -341,9 +341,14 @@ function ConfirmBtn({ title, desc, confirmLabel, onConfirm, btn, children }: Con
   const [rect, setRect] = useState<DOMRect | null>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const popRef = useRef<HTMLDivElement>(null)
+  const cancelRef = useRef<HTMLButtonElement>(null)
 
   useEffect(() => {
     if (!open) return
+    // Move focus into the popover on open (the non-destructive Cancel, so a
+    // stray Enter dismisses rather than confirms). Deferred a frame because
+    // the portaled node is not in the document yet on this render.
+    requestAnimationFrame(() => cancelRef.current?.focus())
     // Portaled to <body>, so the popover is not a DOM descendant of the
     // trigger — the outside-click guard must exclude BOTH, or every click
     // inside the popover (including Cancel/Start) would close it first.
@@ -405,7 +410,7 @@ function ConfirmBtn({ title, desc, confirmLabel, onConfirm, btn, children }: Con
           <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 4 }}>{title}</div>
           <div style={{ fontSize: 11.5, color: 'var(--muted)', lineHeight: 1.5, marginBottom: 9 }}>{desc}</div>
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' } as CSSProperties}>
-            <Btn onClick={() => setOpen(false)}>{i18nT('pages.devFleetPage.cancel')}</Btn>
+            <Btn ref={cancelRef} onClick={() => setOpen(false)}>{i18nT('pages.devFleetPage.cancel')}</Btn>
             <Btn primary onClick={() => { setOpen(false); onConfirm() }}>{confirmLabel || i18nT('pages.devFleetPage.start')}</Btn>
           </div>
         </div>,

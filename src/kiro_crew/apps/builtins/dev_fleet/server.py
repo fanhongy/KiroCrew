@@ -723,6 +723,81 @@ _SANDBOX_ERR_MAX = 900
 _GIT_ERR_MAX = 300
 
 
+# ─── Windows registry-based binary discovery ───
+# Maps tool names to (HKLM registry key, value name, subdirectory) tuples.
+# These registry entries are written by official installers and live in the
+# MACHINE hive (HKLM), which requires admin to write — not agent-writable.
+_WIN_REGISTRY_HINTS: dict[str, list[tuple[str, str, str]]] = {
+    "git": [
+        (r"SOFTWARE\GitForWindows", "InstallPath", "cmd"),
+        (r"SOFTWARE\GitForWindows", "InstallPath", "bin"),
+    ],
+    "gh": [
+        (r"SOFTWARE\GitHub CLI", "InstallPath", ""),
+    ],
+}
+
+
+def _win_registry_bin(name: str) -> str | None:
+    """Resolve *name* via HKLM registry keys written by official installers.
+
+    Trust comes from the key's hive, not from inspecting the file: writing under
+    HKEY_LOCAL_MACHINE requires admin, so the install path is operator-attested
+    in a way an inherited PATH entry is not. Returns the first existing,
+    executable, ABSOLUTE candidate that is not under $HOME, or None when there
+    is no hint for *name* and when nothing qualifies.
+    """
+    try:
+        import winreg  # type: ignore[import-not-found]  # Windows-only
+    except ImportError:
+        return None
+    hints = _WIN_REGISTRY_HINTS.get(name)
+    if not hints:
+        return None
+    suffixes = (".exe", ".cmd", "")
+    # Windows paths are case-insensitive, so the $HOME guard below has to
+    # compare case-folded — otherwise `D:\Users\me` slips past a home
+    # recorded as `d:\users\me`.
+    home_prefix = os.path.normcase(str(Path.home().resolve()) + os.sep)
+    for reg_key, reg_value, subdir in hints:
+        for hive_flag in (winreg.KEY_READ | winreg.KEY_WOW64_64KEY,  # type: ignore[attr-defined]
+                          winreg.KEY_READ | winreg.KEY_WOW64_32KEY):  # type: ignore[attr-defined]
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_key, 0, hive_flag) as key:  # type: ignore[attr-defined]
+                    install_path, _ = winreg.QueryValueEx(key, reg_value)  # type: ignore[attr-defined]
+            except OSError:
+                continue
+            # A hostile or merely broken value must not become a relative
+            # path: `Path("")` is `.`, which would resolve the candidate
+            # against the CWD — agent-writable, the exact vector _trusted_bin
+            # exists to close. REG_DWORD and friends are rejected outright.
+            if not isinstance(install_path, str) or not install_path.strip():
+                continue
+            base = Path(install_path.strip())
+            if not base.is_absolute():
+                continue
+            if subdir:
+                base = base / subdir
+            for suffix in suffixes:
+                cand = base / (name + suffix)
+                try:
+                    if not (cand.is_file() and os.access(cand, os.X_OK)):
+                        continue
+                    real = cand.resolve()
+                    # Reject if under the user's home (same guard as the main
+                    # loop): a per-user install is user-writable, so it carries
+                    # none of the HKLM attestation this path relies on.
+                    if os.path.normcase(str(real)).startswith(home_prefix):
+                        continue
+                    # Deliberately no writability probe: os.access(W_OK) is
+                    # not meaningful on Windows (the read-only attribute is
+                    # user-clearable) and DACL inspection is out of scope.
+                    return str(real)
+                except OSError:
+                    continue
+    return None
+
+
 def _trusted_bin(name: str) -> str | None:
     """Resolve *name* to a canonical executable in a system or Homebrew bin dir.
 
@@ -778,6 +853,14 @@ def _trusted_bin(name: str) -> str | None:
                 continue
         if resolved:
             break
+    # Windows fallback: discover install paths from the MACHINE registry
+    # (HKLM), which is operator-owned and not writable by the agent process.
+    # This covers tools installed outside Program Files (e.g.
+    # D:\software\Git\cmd\git.exe) without trusting the inherited PATH (which
+    # includes agent-writable worktree venvs — the exact vector _trusted_bin
+    # is designed to close).
+    if resolved is None and platform_compat.IS_WINDOWS:
+        resolved = _win_registry_bin(name)
     _TRUSTED_BIN_CACHE[name] = resolved
     return resolved
 

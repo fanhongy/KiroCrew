@@ -1446,4 +1446,30 @@ describe('DevFleetPage restart handshake', () => {
       Object.defineProperty(window.location, 'reload', { configurable: true, value: origReload })
     }
   }, 12000)
+
+  it('moves focus into the confirm popover, onto the non-destructive choice', async () => {
+    // The popover is portaled to <body>, so focus does not follow the DOM from
+    // the trigger — without an explicit move a keyboard user is left outside a
+    // dialog they just opened. Cancel receives it rather than the confirm, so a
+    // stray Enter dismisses instead of restarting the gateway.
+    const FLEET_LIVE = {
+      gateway_service_active: true,
+      worktrees: [
+        { name: 'main', is_main: true, running: false, has_dist: true, behind: 0, is_live: true, path: '/wt/main' },
+      ],
+    }
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET_LIVE), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 1024 }), { status: 200 }))
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderWithProviders(<DevFleetPage />, { route: '/dev-fleet' })
+    await waitFor(() => expect(screen.getAllByText('main').length).toBeGreaterThan(0))
+
+    fireEvent.click(screen.getByText('Pull+Build'))
+    const dialog = await screen.findByRole('dialog', { name: 'Pull + Build main' })
+    const cancel = within(dialog).getByRole('button', { name: 'Cancel' })
+    await waitFor(() => expect(document.activeElement).toBe(cancel))
+  }, 12000)
 })

@@ -4182,6 +4182,7 @@ async def test_fetch_pr_head_oid_refuses_non_merged(monkeypatch):
 def test_trusted_bin_rejects_agent_writable_path(monkeypatch, tmp_path):
     """Bare command names resolve only inside the trusted bin dirs; a planted
     shim in an agent-writable PATH entry is never selected."""
+    monkeypatch.delenv("KIROCREW_DEVFLEET_BIN_GIT", raising=False)
     mod._TRUSTED_BIN_CACHE.clear()
     fake = tmp_path / "git"
     fake.write_text("#!/bin/sh\necho pwned\n")
@@ -4209,6 +4210,7 @@ def test_trusted_bin_pins_the_resolved_target_not_the_symlink(monkeypatch, tmp_p
     """Homebrew's `bin/gh` is a user-writable symlink into `Cellar/`. Caching the
     LINK would let it be repointed between validation and execution, so the
     vetted real path is what gets cached and spawned."""
+    monkeypatch.delenv("KIROCREW_DEVFLEET_BIN_GH", raising=False)
     mod._TRUSTED_BIN_CACHE.clear()
     cellar = tmp_path / "Cellar" / "gh" / "1.0" / "bin"
     cellar.mkdir(parents=True)
@@ -4221,6 +4223,186 @@ def test_trusted_bin_pins_the_resolved_target_not_the_symlink(monkeypatch, tmp_p
     monkeypatch.setattr(mod, "_TRUSTED_BIN_DIRS", (str(bin_dir),))
 
     assert mod._trusted_bin("gh") == str(target.resolve())
+    mod._TRUSTED_BIN_CACHE.clear()
+
+
+# --- Windows registry-based bin discovery ---
+class _FakeRegKey:
+    def __init__(self, key):
+        self.key = key
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _fake_winreg(monkeypatch, values, *, only_flag=None):
+    """Install a stub `winreg` so the Windows-only lookup is testable on POSIX.
+
+    *values* maps a registry key path to the value the stub hands back from
+    QueryValueEx. *only_flag* makes OpenKey succeed for that access flag alone,
+    which is how the 32-bit-view fallback gets exercised. Returns the list of
+    flags OpenKey was called with, so a test can assert the search order.
+    """
+    import sys
+    import types
+
+    stub = types.ModuleType("winreg")
+    stub.HKEY_LOCAL_MACHINE = 0x80000002
+    stub.KEY_READ = 0x20019
+    stub.KEY_WOW64_64KEY = 0x0100
+    stub.KEY_WOW64_32KEY = 0x0200
+    opened: list[int] = []
+
+    def open_key(hive, key, _reserved, flag):
+        opened.append(flag)
+        if only_flag is not None and flag != only_flag:
+            raise OSError(2, "not found")
+        if key not in values:
+            raise OSError(2, "not found")
+        return _FakeRegKey(key)
+
+    stub.OpenKey = open_key
+    stub.QueryValueEx = lambda key, _name: (values[key.key], 1)
+    monkeypatch.setitem(sys.modules, "winreg", stub)
+    return opened
+
+
+def _install_git(root, subdir="cmd"):
+    d = root / subdir
+    d.mkdir(parents=True, exist_ok=True)
+    exe = d / "git.exe"
+    exe.write_text("binary")
+    exe.chmod(0o555)
+    return exe
+
+
+def _home_elsewhere(monkeypatch, tmp_path):
+    """Point $HOME away from the fixture install so the home guard is not what
+    the assertion ends up measuring. USERPROFILE too — that is what Path.home()
+    reads on the Windows leg of CI."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(elsewhere))
+    monkeypatch.setenv("USERPROFILE", str(elsewhere))
+
+
+def test_win_registry_bin_none_without_winreg():
+    """On a non-Windows host there is no winreg, so the helper is inert rather
+    than raising into _trusted_bin's resolution path."""
+    if mod.platform_compat.IS_WINDOWS:
+        pytest.skip("winreg is importable on Windows")
+    assert mod._win_registry_bin("git") is None
+
+
+def test_win_registry_bin_finds_install_outside_program_files(monkeypatch, tmp_path):
+    """The bug this closes: git installed on a D: drive rather than under
+    Program Files is invisible to the hardcoded dir list, which silently
+    emptied the entire fleet instead of reporting a missing toolchain."""
+    root = tmp_path / "software" / "Git"
+    exe = _install_git(root)
+    _fake_winreg(monkeypatch, {r"SOFTWARE\GitForWindows": str(root)})
+    _home_elsewhere(monkeypatch, tmp_path)
+
+    assert mod._win_registry_bin("git") == str(exe.resolve())
+
+
+def test_win_registry_bin_falls_back_to_the_32_bit_view(monkeypatch, tmp_path):
+    """A 32-bit installer writes its key into the WOW6432Node view only, so both
+    views have to be consulted or those hosts stay broken."""
+    root = tmp_path / "Git"
+    exe = _install_git(root)
+    thirty_two = 0x20019 | 0x0200
+    opened = _fake_winreg(monkeypatch, {r"SOFTWARE\GitForWindows": str(root)}, only_flag=thirty_two)
+    _home_elsewhere(monkeypatch, tmp_path)
+
+    assert mod._win_registry_bin("git") == str(exe.resolve())
+    assert opened[0] == 0x20019 | 0x0100, "the native 64-bit view must be tried first"
+    assert thirty_two in opened
+
+
+def test_win_registry_bin_rejects_relative_and_non_string_values(monkeypatch, tmp_path):
+    """An empty, blank, relative or REG_DWORD value must not degrade into a
+    CWD-relative lookup: the CWD is an agent-writable worktree, which is the
+    exact vector _trusted_bin exists to close."""
+    # Plant a shim at every location a bogus value would resolve to with the
+    # CWD as the base, so the assertion fails if any guard is removed rather
+    # than passing because the fixture happened not to line up.
+    _install_git(tmp_path)  # <cwd>/cmd/git.exe   — reached by "" / blank
+    _install_git(tmp_path / "Git")  # <cwd>/Git/cmd/git.exe — reached by "Git", "./Git"
+    monkeypatch.chdir(tmp_path)
+    _home_elsewhere(monkeypatch, tmp_path)
+
+    for bogus in ("", "   ", "Git", "./Git", 4, None):
+        _fake_winreg(monkeypatch, {r"SOFTWARE\GitForWindows": bogus})
+        assert mod._win_registry_bin("git") is None, bogus
+
+
+def test_win_registry_bin_rejects_install_under_home(monkeypatch, tmp_path):
+    """A per-user install is user-writable, so it carries none of the HKLM
+    attestation this path relies on."""
+    home = tmp_path / "home" / "me"
+    root = home / "AppData" / "Git"
+    _install_git(root)
+    _fake_winreg(monkeypatch, {r"SOFTWARE\GitForWindows": str(root)})
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+
+    assert mod._win_registry_bin("git") is None
+
+
+def test_win_registry_bin_has_no_hint_for_arbitrary_names(monkeypatch, tmp_path):
+    """Only tools with a known official-installer key are discoverable this way;
+    an unknown name must not reach the registry at all."""
+    _fake_winreg(monkeypatch, {r"SOFTWARE\GitForWindows": str(tmp_path)})
+    assert mod._win_registry_bin("definitely-not-a-real-tool-xyz") is None
+
+
+def test_trusted_bin_consults_the_registry_only_on_windows(monkeypatch):
+    """The registry lookup is a Windows-only last resort: it must not run on
+    POSIX, where the trusted dir list is the whole contract."""
+    calls: list[str] = []
+    monkeypatch.delenv("KIROCREW_DEVFLEET_BIN_GIT", raising=False)
+    monkeypatch.setattr(
+        mod, "_win_registry_bin", lambda n: calls.append(n) or "C:/w/git.exe"
+    )
+    monkeypatch.setattr(mod, "_TRUSTED_BIN_DIRS", ())
+
+    mod._TRUSTED_BIN_CACHE.clear()
+    monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
+    assert mod._trusted_bin("git") is None
+    assert calls == []
+
+    mod._TRUSTED_BIN_CACHE.clear()
+    monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", True)
+    assert mod._trusted_bin("git") == "C:/w/git.exe"
+    assert calls == ["git"]
+    mod._TRUSTED_BIN_CACHE.clear()
+
+
+def test_trusted_bin_prefers_a_trusted_dir_over_the_registry(monkeypatch, tmp_path):
+    """The registry is a fallback, not a shortcut: a tool sitting in a trusted
+    bin dir wins and the registry is never consulted for it."""
+    calls: list[str] = []
+    monkeypatch.delenv("KIROCREW_DEVFLEET_BIN_GIT", raising=False)
+    monkeypatch.setattr(
+        mod, "_win_registry_bin", lambda n: calls.append(n) or "C:/w/git.exe"
+    )
+    exe = tmp_path / "git"
+    exe.write_text("#!/bin/sh\nexit 0\n")
+    exe.chmod(0o555)
+    monkeypatch.setattr(mod, "_TRUSTED_BIN_DIRS", (str(tmp_path),))
+    # Simulate a Windows host wholesale: the POSIX ownership guard does not
+    # apply there, and it would reject this fixture when the suite runs as root.
+    monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", True)
+    monkeypatch.setattr(mod.platform_compat, "IS_POSIX", False)
+    _home_elsewhere(monkeypatch, tmp_path)
+
+    mod._TRUSTED_BIN_CACHE.clear()
+    assert mod._trusted_bin("git") == str(exe.resolve())
+    assert calls == []
     mod._TRUSTED_BIN_CACHE.clear()
 
 

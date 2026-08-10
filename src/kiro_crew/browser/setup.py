@@ -34,6 +34,7 @@ from kiro_crew.mcp_playwright_proxy import (
     _resolve_playwright_cmd,
 )
 from kiro_crew.mcp_utils import mcp_server_alias
+from kiro_crew.security import is_sensitive_path
 
 logger = logging.getLogger(__name__)
 
@@ -719,6 +720,37 @@ def get_playwright_mcp_env() -> dict[str, str]:
     return env
 
 
+@contextlib.contextmanager
+def _playwright_config_locked(config_path: Path) -> Iterator[None]:
+    """Hold the exclusive advisory lock guarding ``playwright-config.json``.
+
+    Every writer of that file must serialize on the shared ``.lock`` sidecar:
+    :func:`generate_playwright_config` (Settings saves via
+    ``asyncio.to_thread``, ``browse setup``/``cli_setup`` pre-loop) and
+    :func:`repair_playwright_config` (proxy startup, pre-loop). A lock-free
+    read-modify-write races the others and installs a stale snapshot over
+    whichever side wrote first — e.g. the proxy's self-heal discarding a
+    just-selected browser engine. Same sidecar pattern as
+    :func:`_kiro_mcp_locked`.
+
+    Blocking: callers on the event loop must dispatch through
+    ``asyncio.to_thread``. Not reentrant.
+    """
+    # Derive the sidecar from the RESOLVED path: a symlinked config and its
+    # target must converge on ONE lock file, or a writer addressing the link
+    # and a writer addressing the target would lock independently and race.
+    config_path = config_path.resolve()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = config_path.with_name(config_path.name + ".lock")
+    lock_path.touch(exist_ok=True)
+    # "r+" (not "r"): Windows msvcrt.locking requires a writable fd, and
+    # platform_compat swallows the EACCES an "r" fd would raise — which would
+    # silently degrade this to a no-op.
+    with open(lock_path, "r+") as lf:
+        with platform_compat.file_lock(lf.fileno(), exclusive=True):
+            yield
+
+
 def generate_playwright_config(engine: str | None = None) -> Path:
     """Generate ``<config_dir>/playwright-config.json`` with absolute paths.
 
@@ -768,8 +800,132 @@ def generate_playwright_config(engine: str | None = None) -> Path:
         "capabilities": ["network", "storage"],
     }
 
-    config_path.write_text(json.dumps(config, indent=2))
+    # Serialize with the other writer of this file (repair_playwright_config's
+    # proxy-startup self-heal) so a concurrent repair cannot install its stale
+    # snapshot over this fresh generation. See _playwright_config_locked.
+    with _playwright_config_locked(config_path):
+        config_path.write_text(json.dumps(config, indent=2))
     return config_path
+
+
+def repair_playwright_config(config_path: Path | str | None = None) -> bool:
+    """Self-heal a stale ``playwright-config.json`` on load (#2491).
+
+    :func:`generate_playwright_config` only attaches
+    ``contextOptions.storageState`` when the file exists at GENERATION time
+    (#2209), but nothing re-validated an already-written config: one generated
+    before that fix — or whose storage-state file was later removed — kept a
+    dangling reference forever. Playwright raises ENOENT at context creation
+    for it, breaking every ``browser_*`` call, and the running playwright-mcp
+    process caches the config, so regenerating it did not recover a live
+    session (#2491).
+
+    Called at proxy startup — the config's load moment — from
+    ``mcp_playwright_proxy.run_proxy``. When the on-disk config references a
+    storage-state file that no longer exists, drop the key (the same
+    degrade-to-unauthenticated-context behaviour a fresh
+    :func:`generate_playwright_config` produces, so both paths converge on one
+    behaviour) and rewrite the config so the repair survives restarts.
+    Deliberately does NOT try to re-seed via :func:`refresh_storage_state`:
+    that is a no-op without a cookie source (the OSS default), and if a cookie
+    source ever writes the file back, the untouched-when-present branch keeps
+    the key on the next load.
+
+    Returns ``True`` when a repair was written. A config that is valid,
+    keyless, absent, or unparseable is left byte-for-byte untouched —
+    unparseable ones fall through to Playwright MCP's own config error, which
+    names the file, whereas guessing at a rewrite here could destroy a config
+    the user hand-edited.
+
+    The read-validate-write runs under :func:`_playwright_config_locked`, the
+    same interprocess lock :func:`generate_playwright_config` takes, so the
+    repair can neither tear a concurrent generation nor install a stale
+    snapshot over one (e.g. discarding a just-selected browser engine).
+    """
+    path = Path(config_path) if config_path is not None else config_dir() / "playwright-config.json"
+    # Playwright resolves a relative storageState against the config path AS
+    # GIVEN to it — the link's directory when ``--config`` names a symlink —
+    # so capture that lexical base BEFORE resolving the link.
+    lexical_base = path.parent
+    # Repair THROUGH a symlink, not over it: ``os.replace`` inside
+    # ``atomic_write`` would swap a symlinked config for a regular file,
+    # destroying the user's link while leaving the linked target unrepaired.
+    # An unresolvable path (symlink loop -> ELOOP OSError; RuntimeError on
+    # older resolve() implementations) must not crash the proxy before it
+    # spawns Playwright — an unrepairable config is Playwright MCP's own
+    # error to report, same as an unparseable one.
+    try:
+        path = path.resolve()
+    except (OSError, RuntimeError):
+        return False
+    # Refuse sensitive locations BEFORE locking or reading: the ``--config``
+    # value comes from the proxy's argv (normally Kiro Crew's own fixed
+    # registration, but a hand-edited mcp.json could point anywhere), the lock
+    # helper creates a sidecar file NEXT to the target, and this module must
+    # never read credential paths (see security.is_sensitive_path).
+    if is_sensitive_path(str(path)):
+        logger.warning(
+            "refusing to inspect %s for a storageState repair: sensitive path", path
+        )
+        return False
+    try:
+        with _playwright_config_locked(path):
+            try:
+                raw = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                return False
+            try:
+                config = json.loads(raw)
+            except json.JSONDecodeError:
+                return False
+            if not isinstance(config, dict):
+                return False
+            browser = config.get("browser")
+            if not isinstance(browser, dict):
+                return False
+            context_options = browser.get("contextOptions")
+            if not isinstance(context_options, dict):
+                return False
+            storage_state = context_options.get("storageState")
+            if not isinstance(storage_state, str) or not storage_state:
+                return False
+            # Playwright resolves a relative storageState against the config
+            # file's directory AS GIVEN (``lexical_base``, the link's dir for
+            # a symlinked config) — judge existence from the same vantage, not
+            # the proxy CWD or the resolved target's dir, or a working
+            # hand-edited relative reference would be judged missing and
+            # dropped (the inverse of the bug being fixed). Kiro Crew's own
+            # generator always writes an absolute path.
+            state_path = Path(storage_state)
+            if not state_path.is_absolute():
+                state_path = lexical_base / state_path
+            if state_path.exists():
+                return False
+            del context_options["storageState"]
+            logger.warning(
+                "playwright-config.json references a storage-state file that does "
+                "not exist (%s); dropping contextOptions.storageState so the "
+                "browser context starts unauthenticated instead of failing with "
+                "ENOENT (#2491)",
+                storage_state,
+            )
+            # Preserve the file's permissions: other rewrite sites in this
+            # module do the same, and an operator-tightened 0600 must not
+            # silently widen to the umask default.
+            mode = stat.S_IMODE(path.stat().st_mode)
+            atomic_write(path, json.dumps(config, indent=2), mode=mode)
+            return True
+    except OSError:
+        # Unwritable config location (lock sidecar or rewrite failed): the
+        # drop cannot take effect (Playwright MCP reads the file itself), so
+        # surface that plainly instead of pretending the repair landed.
+        logger.warning(
+            "could not rewrite %s after dropping the stale storageState reference; "
+            "browser_* calls will keep failing until it is writable or regenerated "
+            "via 'kirocrew browse setup'",
+            path,
+        )
+        return False
 
 
 def refresh_storage_state() -> dict[str, Any]:

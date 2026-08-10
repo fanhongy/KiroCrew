@@ -455,7 +455,16 @@ describe('a number is never glued to a unit literal', () => {
       offenders.length,
       `${ADVICE}\n\n${offenders.slice(0, 15).join('\n')}`,
     ).toBeLessThanOrEqual(BASELINE)
-  })
+    // Timeout raised well above the 15s global default because this one test's
+    // cost is O(repo size): it reads and scans EVERY source file, so it slows
+    // down as the tree grows and is far slower on a loaded CI runner than on a
+    // dev box (measured 2.1s locally vs 16.3s in CI — past the default, which
+    // failed the run on a timeout while the ceiling itself was still satisfied).
+    // The global default is sized for component tests; a whole-repo walk needs
+    // its own bound or it becomes a time bomb for whichever branch happens to
+    // add the file that crosses the line. This changes no assertion: the
+    // BASELINE ceiling and the two diff-scoped checks below are untouched.
+  }, 60000)
 
   /**
    * Zero tolerance, no stored state. A finding on a line this branch wrote fails,
